@@ -1,636 +1,494 @@
-import json
-import os
 import struct
+import os
+import pickle
 import shutil
-from datetime import datetime
-from typing import Dict, List, Optional, Any
-HEADER_SIZE = 128
-MAGIC_NUMBER = b'UFC2025'
-RECORD_FORMAT = 'i50s50s12s50s50s10s50s'
-RECORD_SIZE = struct.calcsize(RECORD_FORMAT)
+import json
+import re
 
+RECORD_FMT = '<I10s8s50s50s30s30s30sB'
+RECORD_SIZE = struct.calcsize(RECORD_FMT)
 
-class HashIndex:
-    def __init__(self, size=1000):
-        self.size = size
-        self.table = [None] * size
-        self.collisions = 0
+def _encode(s, length):
+    b = str(s).encode('utf-8')[:length]
+    return b.ljust(length, b'\x00')
 
-    def _hash(self, key, attempt=0):
-        if isinstance(key, str):
-            key_hash = 0
-            for char in key:
-                key_hash = (key_hash * 31 + ord(char)) % self.size
-            key = key_hash
+def _decode(bs):
+    return bs.split(b'\x00', 1)[0].decode('utf-8')
 
-        h1 = key % self.size
-        h2 = 1 + (key % (self.size - 1))
-        return (h1 + attempt * h2) % self.size
+def _is_numeric_only(s: str):
+    return bool(re.fullmatch(r"\d+", s.strip())) if isinstance(s, str) and s.strip() else False
 
-    def add(self, key, value):
-        attempt = 0
-        while attempt < self.size:
-            index = self._hash(key, attempt)
-            if self.table[index] is None:
-                self.table[index] = (key, [value])
-                return True
-            elif self.table[index][0] == key:
-                if value not in self.table[index][1]:
-                    self.table[index][1].append(value)
-                return True
-            self.collisions += 1
-            attempt += 1
+def _validate_fight_time_mmss(s: str):
+    if not isinstance(s, str):
         return False
-
-    def get(self, key):
-        attempt = 0
-        while attempt < self.size:
-            index = self._hash(key, attempt)
-            item = self.table[index]
-            if item is None:
-                return []
-            elif item[0] == key:
-                return item[1]
-            attempt += 1
-        return []
-
-    def remove(self, key, value):
-        attempt = 0
-        while attempt < self.size:
-            index = self._hash(key, attempt)
-            if self.table[index] is None:
-                return False
-            elif self.table[index][0] == key:
-                if value in self.table[index][1]:
-                    self.table[index][1].remove(value)
-                    if not self.table[index][1]:
-                        self.table[index] = None
-                    return True
-                return False
-            attempt += 1
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", s.strip())
+    if not m:
         return False
+    seconds = int(m.group(2))
+    return 0 <= seconds < 60
 
-    def get_all_keys(self):
-        keys = []
-        for item in self.table:
-            if item is not None:
-                keys.append(item[0])
-        return keys
+class Record:
+    __slots__ = ('id','date','fight_time','event','location','fighter_1','fighter_2','winner','active')
+    def __init__(self,id:int, date:str, fight_time:str, event:str, location:str, fighter_1:str, fighter_2:str, winner:str, active=1):
+        self.id = int(id)
+        self.date = date
+        self.fight_time = fight_time
+        self.event = event
+        self.location = location
+        self.fighter_1 = fighter_1
+        self.fighter_2 = fighter_2
+        self.winner = winner
+        self.active = int(active)
 
-    def get_all_values(self):
-        values = []
-        for item in self.table:
-            if item is not None:
-                values.extend(item[1])
-        return list(set(values))
+    def pack(self):
+        return struct.pack(RECORD_FMT,
+                           self.id,
+                           _encode(self.date,10),
+                           _encode(self.fight_time,8),
+                           _encode(self.event,50),
+                           _encode(self.location,50),
+                           _encode(self.fighter_1,30),
+                           _encode(self.fighter_2,30),
+                           _encode(self.winner,30),
+                           self.active)
+
+    @classmethod
+    def unpack(cls, bs):
+        vals = struct.unpack(RECORD_FMT, bs)
+        return cls(
+            vals[0],
+            _decode(vals[1]),
+            _decode(vals[2]),
+            _decode(vals[3]),
+            _decode(vals[4]),
+            _decode(vals[5]),
+            _decode(vals[6]),
+            _decode(vals[7]),
+            vals[8]
+        )
+
+class Database:
+    def __init__(self, filepath):
+        self.filepath = filepath
+        self.indexpath = filepath + '.idx'
+        self.file = None
+        self.index = {}
 
 
-class DataBase:
-    def __init__(self):
-        self.current_db = None
-        self.hash_id_index =HashIndex(1000)
-        self.hash_fighter_1_index = HashIndex(1000)
-        self.hash_fighter_2_index = HashIndex(1000)
-        self.hash_location_index = HashIndex(1000)
-        self.hash_event_index = HashIndex(1000)
-        self.hash_winner_index = HashIndex(1000)
-        self.hash_date_index = HashIndex(1000)
-        self.metadata = {}
-        self.free_positions = []
+    def create(self, overwrite=False):
+        if os.path.exists(self.filepath) and not overwrite:
+            raise FileExistsError('DB file already exists')
+        open(self.filepath, 'wb').close()
+        self.index = {}
+        self._save_index()
 
-    def create_db(self, name: str) -> bool:
-        try:
-            os.makedirs('data', exist_ok=True)
-            with open(f'data/{name}.bin','wb') as f:
-                header = struct.pack('7s50si', MAGIC_NUMBER, name.encode('utf-8'), 0)
-                f.write(header.ljust(HEADER_SIZE, b'\x00'))
-
-            self.current_db = name
-            self.hash_id_index = HashIndex(1000)
-            self.hash_fighter_1_index = HashIndex(1000)
-            self.hash_fighter_2_index = HashIndex(1000)
-            self.hash_location_index = HashIndex(1000)
-            self.hash_event_index = HashIndex(1000)
-            self.hash_winner_index = HashIndex(1000)
-            self.hash_date_index = HashIndex(1000)
-            self.free_positions = []
-            self.metadata = {
-                'name': name,
-                'created_at': datetime.now().isoformat(),
-                'record_count': 0,
-                'last_update': datetime.now().isoformat(),
-                'file_format': 'binary',
-                'record_size': RECORD_SIZE,
-                'header_size': HEADER_SIZE
-            }
-            self._save_metadata()
-            print(f"Data base {name} has been created successfully")
-            return True
-        except Exception as e:
-            print(f"Failed: {e}")
-            return False
-
-    def open_db(self, name: str) -> bool:
-        try:
-            if not os.path.exists(f'data/{name}.bin'):
-                print(f"Data base {name} is not found")
-                return False
-            with open(f'data/{name}.bin', 'rb') as f:
-                magic = f.read(7)
-                if magic != MAGIC_NUMBER:
-                    print("Wrong format")
-                    return False
-            self.current_db = name
-            if os.path.exists(f'data/{name}_meta.json'):
-                with open(f'data/{name}_meta.json', 'r',encoding='utf-8') as f:
-                    self.metadata = json.load(f)
-            else:
-                self.metadata = {
-                    'name': name,
-                    'created_at': datetime.now().isoformat(),
-                    'record_count': 0,
-                    'file_format': 'binary'
-                }
-            self._load_indexes()
-            print(f"Data base {name} has been opened successfully")
-            return True
-        except Exception as e:
-            print(f"Failed: {e}")
-            return False
-
-    def delete_db(self, name: str) -> bool:
-        try:
-            files_to_delete = [
-                f'data/{name}.bin',
-                f'data/{name}_meta.json',
-                f'data/{name}_backup.json',
-                f'data/{name}_hash_index.json',
-                f'data/{name}_free_positions.json'
-            ]
-            success = True
-            for f_path in files_to_delete:
-                if os.path.exists(f_path):
-                    try:
-                        os.remove(f_path)
-                        print(f"File {f_path} has been deleted successfully")
-                    except Exception as e:
-                        print(f"Failed for {f_path}: {e}")
-                        success = False
-            if self.current_db == name:
-                self.current_db = None
-                self.hash_id_index = HashIndex(1000)
-                self.hash_fighter_1_index = HashIndex(1000)
-                self.hash_fighter_2_index = HashIndex(1000)
-                self.hash_location_index = HashIndex(1000)
-                self.hash_event_index = HashIndex(1000)
-                self.hash_winner_index = HashIndex(1000)
-                self.hash_date_index = HashIndex(1000)
-                self.metadata = {}
-                self.free_positions = []
-            if success:
-                print(f"Data base {name} has been deleted successfully")
-            return success
-        except Exception as e:
-            print(f"Failed: {e}")
-            return False
-
-    def clear_db(self) -> bool:
-        if not self.current_db:
-            print("Data base is not opened")
-            return False
-        try:
-            with open(f'data/{self.current_db}.bin', 'wb') as f:
-                header = struct.pack('7s50si', MAGIC_NUMBER, self.current_db.encode('utf-8'), 0)
-                f.write(header.ljust(HEADER_SIZE, b'\x00'))
-            self.hash_id_index = HashIndex(1000)
-            self.hash_fighter_1_index = HashIndex(1000)
-            self.hash_fighter_2_index = HashIndex(1000)
-            self.hash_location_index = HashIndex(1000)
-            self.hash_event_index = HashIndex(1000)
-            self.hash_winner_index = HashIndex(1000)
-            self.hash_date_index = HashIndex(1000)
-            self.free_positions = []
-            self.metadata['record_count'] = 0
-            self.metadata['last_update'] = datetime.now().isoformat()
-            self._save_metadata()
-            self._save_indexes()
-            print(f"Data base {self.current_db} has been cleaned successfully")
-            return True
-        except Exception as e:
-            print(f"Failed: {e}")
-            return False
-
-    def save_db(self) -> bool:
-        if not self.current_db:
-            print("Data base is not opened")
-            return False
-        try:
-            self._save_metadata()
-            self._save_indexes()
-            print(f"Data base {self.current_db} has been saved successfully")
-            return True
-        except Exception as e:
-            print(f"Failed: {e}")
-            return False
-
-    def add_record(self, record_data: Dict) -> bool:
-        if not self.current_db:
-            print("Data base is not opened")
-            return False
-        record_id = record_data['id']
-        if self.hash_id_index.get(record_id) is not None:
-            return False
-        position = self._get_next_record_position()
-        binary_data = self._record_to_binary(record_data)
-        with open(f'data/{self.current_db}.bin', 'r+b') as f:
-            f.seek(position)
-            f.write(binary_data)
-        self._update_all_indexes(record_id, position, record_data)
-        self.metadata['record_count'] += 1
-        self.metadata['last_update'] = datetime.now().isoformat()
-        self._update_file_header()
-        self._save_indexes()
-        return True
-
-    def delete_record(self, field_name: str, field_value: Any) -> str:
-        if not self.current_db:
-            return "Data base is not opened"
-        deleted_count = 0
-        if field_name == 'id':
-            record_id = field_value
-            positions = self.hash_id_index.get(record_id)
-            if positions:
-                position = positions[0] if positions else None
-                if position and self._remove_single_record(record_id, position):
-                    deleted_count = 1
+    def open(self):
+        if not os.path.exists(self.filepath):
+            raise FileNotFoundError('DB file not found')
+        self.file = open(self.filepath, 'r+b')
+        if os.path.exists(self.indexpath):
+            with open(self.indexpath, 'rb') as f:
+                self.index = pickle.load(f)
         else:
-            record_ids = self._find_ids_by_field(field_name, field_value)
-            for record_id in record_ids:
-                positions = self.hash_id_index.get(record_id)
-                if positions:
-                    position = positions[0]
-                    if position and self._remove_single_record(record_id, position):
-                        deleted_count += 1
+            self._rebuild_index()
 
-        if deleted_count > 0:
-            self.metadata['record_count'] -= deleted_count
-            self._update_file_header()
-            self._save_indexes()
-            return f"Success, number of deleted records: {deleted_count}"
-        else:
-            return "No deleted records"
-
-    def search_records(self, field_name: str, field_value: Any) -> List[Dict]:
-        if not self.current_db:
-            print("Data base is not opened")
-            return []
-        record_ids = self._find_ids_by_field(field_name, field_value)
-        records = []
-        for record_id in record_ids:
-            record = self.get_record_by_id(record_id)
-            if record:
-                records.append(record)
-
-        return records
-
-    def update_record(self, record_id: int, updates: Dict) -> bool:
-        positions = self.hash_id_index.get(record_id)
-        if not positions:
-            return False
-        position = positions[0]
-        current_record = self.get_record_by_id(record_id)
-        if not current_record:
-            return False
-        updated_record = {**current_record, **updates}
-        if 'id' in updates and updates['id'] != record_id:
-            if self.hash_id_index.get(updates['id']) is not None:
-                return False
-        self._remove_from_all_indexes(record_id, current_record)
-        binary_data = self._record_to_binary(updated_record)
-        with open(f'data/{self.current_db}.bin', 'r+b') as f:
-            f.seek(position)
-            f.write(binary_data)
-        if 'id' in updates:
-            self.hash_id_index.remove(record_id)
-            self.hash_id_index.add(updates['id'], position)
-            record_id = updates['id']
-
-        self._update_all_indexes(record_id, position, updated_record)
-        self._save_indexes()
-        return True
-
-    def create_backup(self, backup_name: str) -> bool:
-        if not self.current_db:
-            print("Data base is not opened")
-            return False
-        try:
-            os.makedirs('backups', exist_ok=True)
-            backup_dir = f'backups/{backup_name}'
-            os.makedirs(backup_dir, exist_ok=True)
-            files_to_backup = [
-                f'data/{self.current_db}.bin',
-                f'data/{self.current_db}_meta.json',
-                f'data/{self.current_db}_indexes.json',
-                f'data/{self.current_db}_hash_index.json'
-            ]
-
-            for file_path in files_to_backup:
-                if os.path.exists(file_path):
-                    shutil.copy2(file_path, f'{backup_dir}/{os.path.basename(file_path)}')
-            backup_meta = {
-                'backup_name': backup_name,
-                'timestamp': datetime.now().isoformat(),
-                'original_db': self.current_db,
-                'record_count': self.metadata['record_count']
-            }
-
-            with open(f'{backup_dir}/backup_meta.json', 'w') as f:
-                json.dump(backup_meta, f, indent=2)
-
-            print(f"Backup '{backup_name}' has been created successfully")
-            return True
-
-        except Exception as e:
-            print(f"Failed: {e}")
-            return False
-
-    def restore_from_backup(self, backup_name: str) -> bool:
-        try:
-            backup_dir = f'backups/{backup_name}'
-            if not os.path.exists(backup_dir):
-                print(f"Backup {backup_name} is not found")
-                return False
-            with open(f'{backup_dir}/backup_meta.json', 'r') as f:
-                backup_meta = json.load(f)
-            original_db = backup_meta['original_db']
-
-            files_to_restore = [
-                f'{original_db}.bin',
-                f'{original_db}_meta.json',
-                f'{original_db}_indexes.json',
-                f'{original_db}_hash_index.json'
-            ]
-            for file_name in files_to_restore:
-                src_path = f'{backup_dir}/{file_name}'
-                dst_path = f'data/{file_name}'
-                if os.path.exists(src_path):
-                    shutil.copy2(src_path, dst_path)
-            success = self.open_db(original_db)
-            if success:
-                print(f"Data base has been successfully restored from {backup_name}")
-            return success
-
-        except Exception as e:
-            print(f"Failed: {e}")
-            return False
-
-
-    def _record_to_binary(record: Dict) -> bytes:
-        return (struct.pack(
-            RECORD_FORMAT,
-            record['id'],
-            record.get('location', '').encode('utf-8'),
-            record.get('event_name', '').encode('utf-8'),
-            record.get('date', '').encode('utf-8'),
-            record.get('fighter_1_name', '').encode('utf-8'),
-            record.get('fighter_2_name', '').encode('utf-8'),
-            record.get('fight_time', '').encode('utf-8'),
-            record.get('winner', '').encode('utf-8')
-        ))
-
-    def _binary_to_record(binary_data: bytes) -> Dict:
-        data = struct.unpack(RECORD_FORMAT, binary_data)
-        return {
-            'id': data[0],
-            'location': data[1].decode('utf-8').strip('\x00'),
-            'event_name': data[2].decode('utf-8').strip('\x00'),
-            'date': data[3].decode('utf-8').strip('\x00'),
-            'fighter_1_name': data[4].decode('utf-8').strip('\x00'),
-            'fighter_2_name': data[5].decode('utf-8').strip('\x00'),
-            'fight_time': data[6].decode('utf-8').strip('\x00'),
-            'winner': data[7].decode('utf-8').strip('\x00')
-        }
-
-    def _get_next_record_position(self) -> int:
-        if self.free_positions:
-            return self.free_positions.pop()
-        else:
-            file_size = os.path.getsize(f'data/{self.current_db}.bin')
-            return file_size
-
-    def _update_file_header(self):
-        with open(f'data/{self.current_db}.bin', 'r+b') as f:
-            f.seek(57)
-            f.write(struct.pack('i', self.metadata['record_count']))
-
-    def get_record_by_id(self, record_id: int) -> Optional[Dict]:
-        positions = self.hash_id_index.get(record_id)
-        if not positions:
-            return None
-        try:
-            position = positions[0]
-            with open(f'data/{self.current_db}.bin', 'rb') as f:
-                f.seek(position)
-                binary_data = f.read(RECORD_SIZE)
-                return self.binary_to_record(binary_data)
-        except Exception as e:
-            print(f"Failed: {e}")
-            return None
-
-    def _find_ids_by_field(self, field_name: str, field_value: Any) -> List[int]:
-        if field_name == 'id':
-            return [field_value] if self.hash_id_index.get(field_value) else []
-        elif field_name == 'location':
-            return self.hash_location_index.get(field_value)
-        elif field_name == 'event_name':
-            return self.hash_event_index.get(field_value)
-        elif field_name == 'fighter_1_name':
-            return self.hash_fighter_1_index.get(field_value)
-        elif field_name == 'fighter_2_name':
-            return self.hash_fighter_2_index.get(field_value)
-        elif field_name == 'winner':
-            return self.hash_winner_index.get(field_value)
-        elif field_name == 'date':
-            return self.hash_date_index.get(field_value)
-        else:
-            return []
-
-    def _update_all_indexes(self, record_id: int, position: int, record_data: Dict):
-        self.hash_id_index.add(record_id, position)
-        location = record_data.get('location', '')
-        if location:
-            self.hash_location_index.add(location, record_id)
-        event = record_data.get('event_name', '')
-        if event:
-            self.hash_event_index.add(event, record_id)
-
-        fighter_1 = record_data.get('fighter_1_name', '')
-        if fighter_1:
-            self.hash_fighter_1_index.add(fighter_1, record_id)
-
-        fighter_2 = record_data.get('fighter_2_name', '')
-        if fighter_2:
-            self.hash_fighter_2_index.add(fighter_2, record_id)
-
-        winner = record_data.get('winner', '')
-        if winner:
-            self.hash_winner_index.add(winner, record_id)
-
-        date = record_data.get('date', '')
-        if date:
-            self.hash_date_index.add(date, record_id)
-
-    def _remove_from_all_indexes(self, record_id: int, record_data: Dict):
-        location = record_data.get('location', '')
-        if location:
-            self.hash_location_index.remove(location, record_id)
-        winner = record_data.get('winner', '')
-        if winner:
-            self.hash_winner_index.remove(winner, record_id)
-
-        date = record_data.get('date', '')
-        if date:
-            self.hash_date_index.remove(date, record_id)
-
-        event = record_data.get('event_name', '')
-        if event:
-            self.hash_event_index.remove(event, record_id)
-
-        fighter_1 = record_data.get('fighter_1_name', '')
-        if fighter_1:
-            self.hash_fighter_1_index.remove(fighter_1, record_id)
-
-        fighter_2 = record_data.get('fighter_2_name', '')
-        if fighter_2:
-            self.hash_fighter_2_index.remove(fighter_2, record_id)
-
-    def _remove_single_record(self, record_id: int, position: int) -> bool:
-        record = self.get_record_by_id(record_id)
-        if not record:
-            return False
-        self.hash_id_index.remove(record_id)
-        self._remove_from_all_indexes(record_id, record)
-        self.free_positions.append(position)
-        return True
-
-    def _save_indexes(self) -> bool:
-        if not self.current_db:
-            print("Data base is not opened")
-            return False
-        try:
-            indexes_data = {
-                'hash_id_index': {
-                    'size': self.hash_id_index.size,
-                    'collisions': self.hash_id_index.collisions,
-                    'table': self.hash_id_index.table
-                },
-                'hash_location_index': {
-                    'size': self.hash_location_index.size,
-                    'collisions': self.hash_location_index.collisions,
-                    'table': self.hash_location_index.table
-                },
-                'hash_event_index': {
-                    'size': self.hash_event_index.size,
-                    'collisions': self.hash_event_index.collisions,
-                    'table': self.hash_event_index.table
-                },
-                'hash_fighter_1_index': {
-                    'size': self.hash_fighter_1_index.size,
-                    'collisions': self.hash_fighter_1_index.collisions,
-                    'table': self.hash_fighter_1_index.table
-            },
-                'hash_fighter_2_index': {
-                    'size': self.hash_fighter_2_index.size,
-                    'collisions': self.hash_fighter_2_index.collisions,
-                    'table': self.hash_fighter_2_index.table
-            },
-                'hash_winner_index': {
-                    'size': self.hash_winner_index.size,
-                    'collisions': self.hash_winner_index.collisions,
-                    'table': self.hash_winner_index.table
-            },
-                'hash_date_index': {
-                    'size': self.hash_date_index.size,
-                    'collisions': self.hash_date_index.collisions,
-                    'table': self.hash_date_index.table
-                },
-                'free_positions': self.free_positions
-            }
-            with open(f'data/{self.current_db}_indexes.json', 'w', encoding='utf-8') as f:
-                json.dump(indexes_data, f, ensure_ascii=False, indent=2)
-            return True
-        except Exception as e:
-            print(f"Failed: {e}")
-            return False
-
-    def _load_indexes(self) -> bool:
-        if not self.current_db:
-            print("Data base is not opened")
-            return False
-        try:
-            if os.path.exists(f'data/{self.current_db}_indexes.json'):
-                with open(f'data/{self.current_db}_indexes.json', 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    self._restore_hash_index(self.hash_id_index, data.get('hash_id_index', {}))
-                    self._restore_hash_index(self.hash_location_index, data.get('hash_location_index', {}))
-                    self._restore_hash_index(self.hash_event_index, data.get('hash_event_index', {}))
-                    self._restore_hash_index(self.hash_fighter_1_index, data.get('hash_fighter_1_index', {}))
-                    self._restore_hash_index(self.hash_fighter_2_index, data.get('hash_fighter_2_index', {}))
-                    self._restore_hash_index(self.hash_winner_index, data.get('hash_winner_index', {}))
-                    self._restore_hash_index(self.hash_date_index, data.get('hash_date_index', {}))
-                    self.free_positions = data.get('free_positions', [])
-        except Exception as e:
-            print(f"Failed: {e}")
-            return False
-
-    def _rebuild_hash_index(self):
-        self.hash_id_index = HashIndex(1000)
-        try:
-            with open(f'data/{self.current_db}.bin', 'rb') as f:
-                f.seek(HEADER_SIZE)
-
-                while True:
-                    position = f.tell()
-                    binary_data = f.read(RECORD_SIZE)
-                    if not binary_data or len(binary_data) < RECORD_SIZE:
-                        break
-                    record = self.binary_to_record(binary_data)
-                    self.hash_id_index.add(record['id'], position)
-
-        except Exception as e:
-            print(f"Failed: {e}")
-            return False
-
-    def _restore_hash_index(self, hash_index, data):
-        if data:
-            hash_index.size = data.get('size', 1000)
-            hash_index.collisions = data.get('collisions', 0)
-            hash_index.table = data.get('table', [None] * hash_index.size)
-
-    def _save_metadata(self):
-        if self.current_db:
+    def close(self):
+        if self.file:
             try:
-                with open(f'data/{self.current_db}_meta.json', 'w', encoding='utf-8') as f:
-                    json.dump(self.metadata, f, indent=2, ensure_ascii=False)
-            except Exception as e:
-                print(f"Failed: {e}")
+                self.file.flush()
+            except Exception:
+                pass
+            self.file.close()
+            self.file = None
+        self._save_index()
 
-    def get_database_info(self):
-        if not self.current_db:
-            return {'error': 'No database opened'}
+    def delete(self):
+        if self.file:
+            self.file.close(); self.file = None
+        if os.path.exists(self.filepath): os.remove(self.filepath)
+        if os.path.exists(self.indexpath): os.remove(self.indexpath)
+        self.index = {}
 
-        info = {
-            'name': self.current_db,
-            'record_count': self.metadata.get('record_count', 0),
-            'created_at': self.metadata.get('created_at', 'N/A'),
-            'last_update': self.metadata.get('last_update', 'N/A'),
-            'hash_collisions': self.hash_id_index.collisions +
-                               self.hash_location_index.collisions +
-                               self.hash_event_index.collisions +
-                               self.hash_fighter_1_index.collisions +
-                               self.hash_fighter_2_index.collisions +
-                               self.hash_winner_index.collisions +
-                               self.hash_date_index.collisions
-        }
-        return info
+    def clear(self):
+        if self.file:
+            self.file.close(); self.file = None
+        open(self.filepath, 'wb').close()
+        self.index = {}
+        self._save_index()
+        self.open()
 
+    def save(self):
+        self._save_index()
+        if self.file:
+            try:
+                self.file.flush()
+            except Exception:
+                pass
+
+    def _save_index(self):
+        with open(self.indexpath, 'wb') as f:
+            pickle.dump(self.index, f)
+
+    def _rebuild_index(self):
+        self.index = {}
+        with open(self.filepath, 'rb') as f:
+            offset = 0
+            while True:
+                bs = f.read(RECORD_SIZE)
+                if not bs or len(bs) < RECORD_SIZE:
+                    break
+                rec = Record.unpack(bs)
+                if rec.active:
+                    self.index[rec.id] = offset
+                offset += RECORD_SIZE
+        self._save_index()
+
+
+    def _record_equals_except_id(self, rec1: Record, rec2: Record):
+        return (
+            rec1.date == rec2.date and
+            rec1.fight_time == rec2.fight_time and
+            rec1.event == rec2.event and
+            rec1.location == rec2.location and
+            rec1.fighter_1 == rec2.fighter_1 and
+            rec1.fighter_2 == rec2.fighter_2 and
+            rec1.winner == rec2.winner
+        )
+
+    def _find_duplicate(self, newrec: Record):
+
+        if not os.path.exists(self.filepath):
+            return False
+        open_mode = self.file is not None
+        if not open_mode:
+            f = open(self.filepath,'rb')
+            try:
+                while True:
+                    bs = f.read(RECORD_SIZE)
+                    if not bs or len(bs) < RECORD_SIZE: break
+                    rec = Record.unpack(bs)
+                    if rec.active and self._record_equals_except_id(rec, newrec):
+                        return True
+            finally:
+                f.close()
+            return False
+        else:
+            self.file.seek(0)
+            while True:
+                bs = self.file.read(RECORD_SIZE)
+                if not bs or len(bs) < RECORD_SIZE: break
+                rec = Record.unpack(bs)
+                if rec.active and self._record_equals_except_id(rec, newrec):
+                    return True
+            return False
+
+    def _next_id(self):
+        if not self.index:
+            return 1
+        max_id = max(self.index.keys())
+        return max_id + 1
+
+    def _renumber_ids(self):
+
+        if not os.path.exists(self.filepath):
+            self.index = {}
+            return
+
+        need_close = False
+        if self.file is None:
+            self.open()
+            need_close = True
+
+
+        self.file.seek(0)
+        offset = 0
+        next_id = 1
+        changes = []
+        while True:
+            bs = self.file.read(RECORD_SIZE)
+            if not bs or len(bs) < RECORD_SIZE:
+                break
+            rec = Record.unpack(bs)
+            if rec.active:
+                if rec.id != next_id:
+                    rec.id = next_id
+
+                    self.file.seek(offset)
+                    self.file.write(rec.pack())
+                    self.file.flush()
+                self.index[rec.id] = offset
+                next_id += 1
+            offset += RECORD_SIZE
+
+
+        self._rebuild_index()
+        if need_close:
+
+            try:
+                self.file.close()
+            except Exception:
+                pass
+            self.file = None
+
+
+    def add(self, record:Record):
+
+        if _is_numeric_only(record.fighter_1) or _is_numeric_only(record.fighter_2) or _is_numeric_only(record.winner):
+            raise ValueError('Fighter names/winner must not be numeric-only strings')
+        if not _validate_fight_time_mmss(record.fight_time):
+            raise ValueError('fight_time must be in MM:SS format, seconds 00-59')
+
+        if record.winner and not (record.winner == record.fighter_1 or record.winner == record.fighter_2):
+            raise ValueError('winner must be one of fighter_1 or fighter_2')
+
+
+        if self.file is None:
+            if not os.path.exists(self.filepath):
+                open(self.filepath,'wb').close()
+            self.open()
+
+
+        assigned_id = self._next_id()
+        if record.id != assigned_id:
+            record.id = assigned_id
+
+
+        if self._find_duplicate(record):
+            raise ValueError('Duplicate record (identical fields except id)')
+
+
+        self.file.seek(0, os.SEEK_END)
+        offset = self.file.tell()
+        self.file.write(record.pack())
+        self.file.flush()
+        self.index[record.id] = offset
+        self._save_index()
+        return record.id
+
+    def _read_at(self, offset):
+        if self.file is None:
+            self.open()
+        self.file.seek(offset)
+        bs = self.file.read(RECORD_SIZE)
+        if not bs or len(bs) < RECORD_SIZE:
+            return None
+        return Record.unpack(bs)
+
+    def get_by_id(self, id_):
+        if id_ not in self.index:
+            return None
+        rec = self._read_at(self.index[id_])
+        if rec and rec.active:
+            return rec
+        return None
+
+    def delete_by_id(self, id_):
+        if id_ not in self.index:
+            return 0
+        offset = self.index[id_]
+        if self.file is None:
+            self.open()
+        self.file.seek(offset)
+        bs = self.file.read(RECORD_SIZE)
+        rec = Record.unpack(bs)
+        rec.active = 0
+        self.file.seek(offset)
+        self.file.write(rec.pack())
+        self.file.flush()
+
+        if id_ in self.index:
+            del self.index[id_]
+
+        self._renumber_ids()
+        self._save_index()
+        return 1
+
+    def delete_by_field(self, field, value):
+
+        count = 0
+        if field == 'id':
+            try:
+                return self.delete_by_id(int(value))
+            except Exception:
+                return 0
+        if self.file is None:
+            self.open()
+        self.file.seek(0)
+        offset = 0
+        while True:
+            bs = self.file.read(RECORD_SIZE)
+            if not bs or len(bs) < RECORD_SIZE:
+                break
+            rec = Record.unpack(bs)
+            if rec.active and getattr(rec, field) == value:
+                rec.active = 0
+                self.file.seek(offset)
+                self.file.write(rec.pack())
+                self.file.flush()
+                if rec.id in self.index:
+                    del self.index[rec.id]
+                count += 1
+            offset += RECORD_SIZE
+        if count > 0:
+            self._renumber_ids()
+            self._save_index()
+        return count
+
+    def search(self, field, value):
+        results = []
+        if field == 'id':
+            try:
+                rec = self.get_by_id(int(value))
+            except Exception:
+                return []
+            if rec: results.append(rec)
+            return results
+        if self.file is None:
+            self.open()
+        self.file.seek(0)
+        while True:
+            bs = self.file.read(RECORD_SIZE)
+            if not bs or len(bs) < RECORD_SIZE:
+                break
+            rec = Record.unpack(bs)
+            if rec.active and getattr(rec, field) == value:
+                results.append(rec)
+        return results
+
+    def edit(self, id_, **kwargs):
+        if id_ not in self.index:
+            raise KeyError('id not found')
+        offset = self.index[id_]
+        rec = self._read_at(offset)
+        if not rec or not rec.active:
+            raise KeyError('record inactive or not found')
+        newrec = Record(rec.id, rec.date, rec.fight_time, rec.event, rec.location, rec.fighter_1, rec.fighter_2, rec.winner, rec.active)
+        for k,v in kwargs.items():
+            if hasattr(newrec, k) and k != 'id' and v is not None:
+                setattr(newrec, k, v)
+
+        if _is_numeric_only(newrec.fighter_1) or _is_numeric_only(newrec.fighter_2) or _is_numeric_only(newrec.winner):
+            raise ValueError('Fighter names/winner must not be numeric-only strings')
+        if not _validate_fight_time_mmss(newrec.fight_time):
+            raise ValueError('fight_time must be in MM:SS format, seconds 00-59')
+        if newrec.winner and not (newrec.winner == newrec.fighter_1 or newrec.winner == newrec.fighter_2):
+            raise ValueError('winner must be one of fighter_1 or fighter_2')
+
+        if self.file is None:
+            self.open()
+        self.file.seek(0)
+        while True:
+            bs = self.file.read(RECORD_SIZE)
+            if not bs or len(bs) < RECORD_SIZE:
+                break
+            other = Record.unpack(bs)
+            if other.active and other.id != newrec.id and self._record_equals_except_id(other, newrec):
+                raise ValueError('Edit would create duplicate record (identical fields except id)')
+
+        self.file.seek(offset)
+        self.file.write(newrec.pack())
+        self.file.flush()
+
+        return newrec
+
+    def backup(self, backup_path):
+
+        self._save_index()
+        was_open = False
+        try:
+            if self.file:
+                try:
+                    self.file.flush()
+                except Exception:
+                    pass
+                try:
+                    self.file.close()
+                    was_open = True
+                    self.file = None
+                except Exception:
+                    self.file = None
+            shutil.copy2(self.filepath, backup_path)
+            if os.path.exists(self.indexpath):
+                shutil.copy2(self.indexpath, backup_path + '.idx')
+        finally:
+            try:
+                if was_open:
+                    self.open()
+            except Exception:
+                self.file = None
+
+    def restore_from_backup(self, backup_path):
+        if self.file:
+            self.file.close(); self.file = None
+        shutil.copy2(backup_path, self.filepath)
+        if os.path.exists(backup_path + '.idx'):
+            shutil.copy2(backup_path + '.idx', self.indexpath)
+        else:
+            self._rebuild_index()
+        self.open()
+
+    def import_json(self, json_path, id_field='id'):
+        with open(json_path,'r',encoding='utf-8') as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            for k in data:
+                if isinstance(data[k], list):
+                    data = data[k]
+                    break
+            else:
+                return 0
+        if not isinstance(data, list):
+            return 0
+        added = 0
+        for item in data:
+            try:
+                rec = Record(
+                    int(item.get(id_field, 0) or 0),
+                    item.get('date','0000-00-00'),
+                    item.get('fight_time','00:00'),
+                    item.get('event',''),
+                    item.get('location',''),
+                    item.get('fighter_1',''),
+                    item.get('fighter_2',''),
+                    item.get('winner','')
+                )
+                self.add(rec)
+                added += 1
+            except Exception:
+                continue
+        return added
+
+    def export_excel(self, excel_path, id_col='id'):
+        try:
+            import pandas as pd
+        except ImportError:
+            raise RuntimeError('pandas is required to export to excel')
+        rows = []
+        for r in self.iterate():
+            rows.append({
+                'id': r.id,
+                'date': r.date,
+                'fight_time': r.fight_time,
+                'event': r.event,
+                'location': r.location,
+                'fighter_1': r.fighter_1,
+                'fighter_2': r.fighter_2,
+                'winner': r.winner
+            })
+        df = pd.DataFrame(rows)
+        df.to_excel(excel_path, index=False)
+        return len(rows)
+
+    def iterate(self):
+        if not os.path.exists(self.filepath):
+            return
+        if self.file is None:
+            self.open()
+        self.file.seek(0)
+        while True:
+            bs = self.file.read(RECORD_SIZE)
+            if not bs or len(bs) < RECORD_SIZE:
+                break
+            rec = Record.unpack(bs)
+            if rec.active:
+                yield rec

@@ -1,0 +1,74 @@
+{
+  "hash_id_index": {
+    "1": [
+      128
+    ],
+    "2": [
+      404
+    ],
+    "3": [
+      680
+    ]
+  },
+  "hash_location_index": {
+    "LA": [
+      2
+    ],
+    "Moscow": [
+      3
+    ],
+    "Las Vegas": [
+      1
+    ]
+  },
+  "hash_event_index": {
+    "UFC FIGHT NIGHT": [
+      2,
+      3
+    ],
+    "UFC 300": [
+      1
+    ]
+  },
+  "hash_fighter_1_index": {
+    "Valentina Snevchenko": [
+      2
+    ],
+    "2": [
+      3
+    ],
+    "Islam Mahachev": [
+      1
+    ]
+  },
+  "hash_fighter_2_index": {
+    "Manon Feron": [
+      2,
+      3
+    ],
+    "Charles Oliviera": [
+      1
+    ]
+  },
+  "hash_winner_index": {
+    "Valentina Shevchenko": [
+      2,
+      3
+    ],
+    "Islam Mahachev": [
+      1
+    ]
+  },
+  "hash_date_index": {
+    "2025-05-10": [
+      2
+    ],
+    "2025-11-12": [
+      3
+    ],
+    "2025-01-15": [
+      1
+    ]
+  },
+  "free_positions": []
+}
