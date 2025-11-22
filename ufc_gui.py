@@ -2,6 +2,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import os
+import shutil
 from database import Database, Record
 
 DB_DEFAULT = 'ufc_db.bin'
@@ -136,25 +137,40 @@ class App(tk.Tk):
                 messagebox.showerror('error', str(e))
 
     def backup(self):
-        path = filedialog.asksaveasfilename(defaultextension='.ufc.bak')
+        path = filedialog.asksaveasfilename(defaultextension='.bak', title="Save backup as")
         if not path:
             return
         try:
             self.db.backup(path)
-            messagebox.showinfo('ok','Backup saved')
+            messagebox.showinfo('ok', 'Backup saved')
         except Exception as e:
-            messagebox.showerror('error', str(e))
+            messagebox.showerror('error', f'Backup failed: {str(e)}')
 
     def restore(self):
-        path = filedialog.askopenfilename()
+        path = filedialog.askopenfilename(
+            filetypes=[('Backup files', '*.bak'), ('All files', '*.*')],
+            title="Select backup file to restore"
+        )
         if not path:
             return
         try:
+
+            if hasattr(self.db, 'file') and self.db.file:
+                self.db.close()
+
             self.db.restore_from_backup(path)
-            messagebox.showinfo('ok','Database restored')
-            self._refresh_list(); self._refresh_combo()
+
+            self.db.open()
+            messagebox.showinfo('ok', 'Database restored')
+            self._refresh_list()
+            self._refresh_combo()
         except Exception as e:
-            messagebox.showerror('error', str(e))
+            messagebox.showerror('error', f'Restore failed: {str(e)}')
+
+            try:
+                self.db.open()
+            except:
+                pass
 
     def import_json(self):
         path = filedialog.askopenfilename(filetypes=[('JSON files','*.json')])
