@@ -4,8 +4,15 @@ import pickle
 import shutil
 import json
 import re
+import struct
+import os
+import pickle
+import shutil
+import json
+import re
 
-RECORD_FMT = '<I10s8s50s50s30s30s30sB'
+
+RECORD_FMT = '<I10s8s50s50s30s30s30s20s20sB'
 RECORD_SIZE = struct.calcsize(RECORD_FMT)
 
 def _encode(s, length):
@@ -27,14 +34,50 @@ def _validate_fight_time_mmss(s: str):
     seconds = int(m.group(2))
     return 0 <= seconds < 60
 
+
+
+RECORD_FMT = '<I10s8s50s50s30s30s30s20s20sB'
+RECORD_SIZE = struct.calcsize(RECORD_FMT)
+
+def _encode(s, length):
+    b = str(s).encode('utf-8')[:length]
+    return b.ljust(length, b'\x00')
+
+def _decode(bs):
+    return bs.split(b'\x00', 1)[0].decode('utf-8')
+
+def _is_numeric_only(s: str):
+    return bool(re.fullmatch(r"\d+", s.strip())) if isinstance(s, str) and s.strip() else False
+
+def _validate_fight_time_mmss(s: str):
+    if not isinstance(s, str):
+        return False
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", s.strip())
+    if not m:
+        return False
+    seconds = int(m.group(2))
+    return 0 <= seconds < 60
+
+
+CARD_TYPES = ("Main Card", "Preliminary Card", "Early Prelims")
+WEIGHT_CLASSES = (
+    "Flyweight","Bantamweight","Featherweight","Lightweight","Welterweight",
+    "Middleweight","Light Heavyweight","Heavyweight",
+    "Women's Strawweight","Women's Flyweight","Women's Bantamweight","Women's Featherweight"
+)
+
 class Record:
-    __slots__ = ('id','date','fight_time','event','location','fighter_1','fighter_2','winner','active')
-    def __init__(self,id:int, date:str, fight_time:str, event:str, location:str, fighter_1:str, fighter_2:str, winner:str, active=1):
+    __slots__ = ('id','date','fight_time','event','location','card_type','weight_class','fighter_1','fighter_2','winner','active')
+    def __init__(self,id:int, date:str, fight_time:str, event:str, location:str,
+                 card_type:str, weight_class:str,
+                 fighter_1:str, fighter_2:str, winner:str, active=1):
         self.id = int(id)
         self.date = date
         self.fight_time = fight_time
         self.event = event
         self.location = location
+        self.card_type = card_type
+        self.weight_class = weight_class
         self.fighter_1 = fighter_1
         self.fighter_2 = fighter_2
         self.winner = winner
@@ -50,6 +93,8 @@ class Record:
                            _encode(self.fighter_1,30),
                            _encode(self.fighter_2,30),
                            _encode(self.winner,30),
+                           _encode(self.card_type,20),
+                           _encode(self.weight_class,20),
                            self.active)
 
     @classmethod
@@ -61,10 +106,12 @@ class Record:
             _decode(vals[2]),
             _decode(vals[3]),
             _decode(vals[4]),
-            _decode(vals[5]),
-            _decode(vals[6]),
-            _decode(vals[7]),
-            vals[8]
+            _decode(vals[8]),  # card_type
+            _decode(vals[9]),  # weight_class
+            _decode(vals[5]),  # fighter_1
+            _decode(vals[6]),  # fighter_2
+            _decode(vals[7]),  # winner
+            vals[10]
         )
 
 class Database:
@@ -73,7 +120,6 @@ class Database:
         self.indexpath = filepath + '.idx'
         self.file = None
         self.index = {}
-
 
     def create(self, overwrite=False):
         if os.path.exists(self.filepath) and not overwrite:
@@ -131,6 +177,8 @@ class Database:
 
     def _rebuild_index(self):
         self.index = {}
+        if not os.path.exists(self.filepath):
+            return
         with open(self.filepath, 'rb') as f:
             offset = 0
             while True:
@@ -143,7 +191,6 @@ class Database:
                 offset += RECORD_SIZE
         self._save_index()
 
-
     def _record_equals_except_id(self, rec1: Record, rec2: Record):
         return (
             rec1.date == rec2.date and
@@ -152,11 +199,12 @@ class Database:
             rec1.location == rec2.location and
             rec1.fighter_1 == rec2.fighter_1 and
             rec1.fighter_2 == rec2.fighter_2 and
-            rec1.winner == rec2.winner
+            rec1.winner == rec2.winner and
+            rec1.card_type == rec2.card_type and
+            rec1.weight_class == rec2.weight_class
         )
 
     def _find_duplicate(self, newrec: Record):
-
         if not os.path.exists(self.filepath):
             return False
         open_mode = self.file is not None
@@ -189,21 +237,17 @@ class Database:
         return max_id + 1
 
     def _renumber_ids(self):
-
         if not os.path.exists(self.filepath):
             self.index = {}
             return
-
         need_close = False
         if self.file is None:
             self.open()
             need_close = True
 
-
         self.file.seek(0)
         offset = 0
         next_id = 1
-        changes = []
         while True:
             bs = self.file.read(RECORD_SIZE)
             if not bs or len(bs) < RECORD_SIZE:
@@ -212,7 +256,6 @@ class Database:
             if rec.active:
                 if rec.id != next_id:
                     rec.id = next_id
-
                     self.file.seek(offset)
                     self.file.write(rec.pack())
                     self.file.flush()
@@ -220,42 +263,38 @@ class Database:
                 next_id += 1
             offset += RECORD_SIZE
 
-
         self._rebuild_index()
         if need_close:
-
             try:
                 self.file.close()
             except Exception:
                 pass
             self.file = None
 
-
     def add(self, record:Record):
-
+        # validations
         if _is_numeric_only(record.fighter_1) or _is_numeric_only(record.fighter_2) or _is_numeric_only(record.winner):
             raise ValueError('Fighter names/winner must not be numeric-only strings')
         if not _validate_fight_time_mmss(record.fight_time):
             raise ValueError('fight_time must be in MM:SS format, seconds 00-59')
-
+        if record.card_type not in CARD_TYPES:
+            raise ValueError(f'card_type must be one of {CARD_TYPES}')
+        if record.weight_class not in WEIGHT_CLASSES:
+            raise ValueError(f'weight_class must be one of {WEIGHT_CLASSES}')
         if record.winner and not (record.winner == record.fighter_1 or record.winner == record.fighter_2):
             raise ValueError('winner must be one of fighter_1 or fighter_2')
-
 
         if self.file is None:
             if not os.path.exists(self.filepath):
                 open(self.filepath,'wb').close()
             self.open()
 
-
         assigned_id = self._next_id()
         if record.id != assigned_id:
             record.id = assigned_id
 
-
         if self._find_duplicate(record):
             raise ValueError('Duplicate record (identical fields except id)')
-
 
         self.file.seek(0, os.SEEK_END)
         offset = self.file.tell()
@@ -304,7 +343,6 @@ class Database:
         return 1
 
     def delete_by_field(self, field, value):
-
         count = 0
         if field == 'id':
             try:
@@ -362,7 +400,9 @@ class Database:
         rec = self._read_at(offset)
         if not rec or not rec.active:
             raise KeyError('record inactive or not found')
-        newrec = Record(rec.id, rec.date, rec.fight_time, rec.event, rec.location, rec.fighter_1, rec.fighter_2, rec.winner, rec.active)
+        newrec = Record(rec.id, rec.date, rec.fight_time, rec.event, rec.location,
+                        rec.card_type, rec.weight_class,
+                        rec.fighter_1, rec.fighter_2, rec.winner, rec.active)
         for k,v in kwargs.items():
             if hasattr(newrec, k) and k != 'id' and v is not None:
                 setattr(newrec, k, v)
@@ -371,6 +411,10 @@ class Database:
             raise ValueError('Fighter names/winner must not be numeric-only strings')
         if not _validate_fight_time_mmss(newrec.fight_time):
             raise ValueError('fight_time must be in MM:SS format, seconds 00-59')
+        if newrec.card_type not in CARD_TYPES:
+            raise ValueError(f'card_type must be one of {CARD_TYPES}')
+        if newrec.weight_class not in WEIGHT_CLASSES:
+            raise ValueError(f'weight_class must be one of {WEIGHT_CLASSES}')
         if newrec.winner and not (newrec.winner == newrec.fighter_1 or newrec.winner == newrec.fighter_2):
             raise ValueError('winner must be one of fighter_1 or fighter_2')
 
@@ -388,11 +432,9 @@ class Database:
         self.file.seek(offset)
         self.file.write(newrec.pack())
         self.file.flush()
-
         return newrec
 
     def backup(self, backup_path):
-
         self._save_index()
         was_open = False
         try:
@@ -448,6 +490,8 @@ class Database:
                     item.get('fight_time','00:00'),
                     item.get('event',''),
                     item.get('location',''),
+                    item.get('card_type', CARD_TYPES[0]),
+                    item.get('weight_class', WEIGHT_CLASSES[0]),
                     item.get('fighter_1',''),
                     item.get('fighter_2',''),
                     item.get('winner','')
@@ -471,6 +515,8 @@ class Database:
                 'fight_time': r.fight_time,
                 'event': r.event,
                 'location': r.location,
+                'card_type': r.card_type,
+                'weight_class': r.weight_class,
                 'fighter_1': r.fighter_1,
                 'fighter_2': r.fighter_2,
                 'winner': r.winner
@@ -492,3 +538,6 @@ class Database:
             rec = Record.unpack(bs)
             if rec.active:
                 yield rec
+
+
+    
