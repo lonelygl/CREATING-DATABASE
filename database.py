@@ -4,37 +4,6 @@ import pickle
 import shutil
 import json
 import re
-import struct
-import os
-import pickle
-import shutil
-import json
-import re
-
-
-RECORD_FMT = '<I10s8s50s50s30s30s30s20s20sB'
-RECORD_SIZE = struct.calcsize(RECORD_FMT)
-
-def _encode(s, length):
-    b = str(s).encode('utf-8')[:length]
-    return b.ljust(length, b'\x00')
-
-def _decode(bs):
-    return bs.split(b'\x00', 1)[0].decode('utf-8')
-
-def _is_numeric_only(s: str):
-    return bool(re.fullmatch(r"\d+", s.strip())) if isinstance(s, str) and s.strip() else False
-
-def _validate_fight_time_mmss(s: str):
-    if not isinstance(s, str):
-        return False
-    m = re.fullmatch(r"(\d{1,2}):(\d{2})", s.strip())
-    if not m:
-        return False
-    seconds = int(m.group(2))
-    return 0 <= seconds < 60
-
-
 
 RECORD_FMT = '<I10s8s50s50s30s30s30s20s20sB'
 RECORD_SIZE = struct.calcsize(RECORD_FMT)
@@ -106,11 +75,11 @@ class Record:
             _decode(vals[2]),
             _decode(vals[3]),
             _decode(vals[4]),
-            _decode(vals[8]),  # card_type
-            _decode(vals[9]),  # weight_class
-            _decode(vals[5]),  # fighter_1
-            _decode(vals[6]),  # fighter_2
-            _decode(vals[7]),  # winner
+            _decode(vals[8]),  
+            _decode(vals[9]), 
+            _decode(vals[5]), 
+            _decode(vals[6]),  
+            _decode(vals[7]),  
             vals[10]
         )
 
@@ -272,7 +241,7 @@ class Database:
             self.file = None
 
     def add(self, record:Record):
-        # validations
+        
         if _is_numeric_only(record.fighter_1) or _is_numeric_only(record.fighter_2) or _is_numeric_only(record.winner):
             raise ValueError('Fighter names/winner must not be numeric-only strings')
         if not _validate_fight_time_mmss(record.fight_time):
