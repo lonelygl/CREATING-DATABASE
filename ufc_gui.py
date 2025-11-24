@@ -12,7 +12,7 @@ class ChooseDbDialog(tk.Toplevel):
         self.selected = None
         ttk.Label(self, text='Choose existing DB or create new').grid(row=0, column=0, columnspan=2, padx=8, pady=8)
 
-        # list existing .bin files
+        
         bins = [f for f in os.listdir('.') if f.endswith('.bin')]
         self.listbox = tk.Listbox(self, height=6, width=40)
         for b in bins:
